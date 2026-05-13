@@ -13,11 +13,15 @@
 package collector
 
 import (
+	"context"
+	"database/sql"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/promslog"
@@ -131,5 +135,208 @@ func TestWithConnectionTimeout(t *testing.T) {
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("there were unfulfilled exceptions: %s", err)
+	}
+}
+
+// TestIsNoDataError pins the trivial identity of ErrNoData. The wrapper
+// exists so callers do not depend on the package-private sentinel value
+// directly; if that contract drifts, this test fails immediately.
+func TestIsNoDataError(t *testing.T) {
+	if !IsNoDataError(ErrNoData) {
+		t.Error("IsNoDataError(ErrNoData) must be true")
+	}
+	if IsNoDataError(nil) {
+		t.Error("IsNoDataError(nil) must be false")
+	}
+	if IsNoDataError(errFnDoesNotExist) {
+		t.Error("IsNoDataError must reject unrelated errors")
+	}
+}
+
+// TestInt32 covers the small helper that drops sql.NullInt32 values to
+// float64 with a NaN-style zero default. The two interesting cases are
+// "valid" (returns the value) and "invalid" (returns 0).
+func TestInt32(t *testing.T) {
+	if got := Int32(sql.NullInt32{Int32: 42, Valid: true}); got != 42 {
+		t.Errorf("Int32(valid=42) = %v, want 42", got)
+	}
+	if got := Int32(sql.NullInt32{Valid: false}); got != 0 {
+		t.Errorf("Int32(invalid) = %v, want 0", got)
+	}
+}
+
+// TestWithAuroraEnabled checks the Option setter we added so future
+// refactors do not silently drop the field assignment. The Option is the
+// only way for cmd/postgres_exporter to flip the in-process flag.
+func TestWithAuroraEnabled(t *testing.T) {
+	p := &PostgresCollector{}
+	if err := WithAuroraEnabled(true)(p); err != nil {
+		t.Fatalf("Option returned error: %v", err)
+	}
+	if !p.auroraEnabled {
+		t.Error("WithAuroraEnabled(true) must flip auroraEnabled on the collector")
+	}
+	if err := WithAuroraEnabled(false)(p); err != nil {
+		t.Fatalf("Option returned error: %v", err)
+	}
+	if p.auroraEnabled {
+		t.Error("WithAuroraEnabled(false) must reset auroraEnabled on the collector")
+	}
+}
+
+// TestExecuteSuccessfulCollectorEmitsSuccessOne and the companion
+// "failed" / "no data" tests verify the execute() wrapper records the
+// right pg_scrape_collector_success value depending on what the
+// Collector.Update returns.
+func TestExecuteSuccessfulCollectorEmitsSuccessOne(t *testing.T) {
+	got := runExecuteAndReadSuccess(t, func(ctx context.Context, inst *instance, ch chan<- prometheus.Metric) error {
+		return nil
+	})
+	if got != 1 {
+		t.Errorf("scrape_collector_success = %v, want 1", got)
+	}
+}
+
+func TestExecuteFailedCollectorEmitsSuccessZero(t *testing.T) {
+	got := runExecuteAndReadSuccess(t, func(ctx context.Context, inst *instance, ch chan<- prometheus.Metric) error {
+		return errFnDoesNotExist
+	})
+	if got != 0 {
+		t.Errorf("scrape_collector_success = %v, want 0", got)
+	}
+}
+
+func TestExecuteNoDataCollectorEmitsSuccessZero(t *testing.T) {
+	got := runExecuteAndReadSuccess(t, func(ctx context.Context, inst *instance, ch chan<- prometheus.Metric) error {
+		return ErrNoData
+	})
+	if got != 0 {
+		t.Errorf("scrape_collector_success = %v, want 0", got)
+	}
+}
+
+// runExecuteAndReadSuccess wraps the Collector under test in a tiny
+// adapter, drains the duration metric, and returns the success metric so
+// the caller can assert against it.
+func runExecuteAndReadSuccess(t *testing.T, update func(ctx context.Context, inst *instance, ch chan<- prometheus.Metric) error) float64 {
+	t.Helper()
+	ch := make(chan prometheus.Metric, 4)
+	c := updateFn(update)
+	execute(context.Background(), "fake", c, &instance{}, ch, promslog.NewNopLogger())
+	close(ch)
+
+	var success float64 = -1
+	for m := range ch {
+		mr := readMetric(m)
+		// Two metrics emitted: duration_seconds and success. We only care
+		// about success here.
+		desc := m.Desc().String()
+		if strings.Contains(desc, "collector_success") {
+			success = mr.value
+		}
+	}
+	if success == -1 {
+		t.Fatal("scrape_collector_success metric was not emitted")
+	}
+	return success
+}
+
+// updateFn lets a test inline its Update implementation without declaring
+// a struct per case.
+type updateFn func(ctx context.Context, inst *instance, ch chan<- prometheus.Metric) error
+
+func (f updateFn) Update(ctx context.Context, inst *instance, ch chan<- prometheus.Metric) error {
+	return f(ctx, inst, ch)
+}
+
+// TestEnableAuroraCollectors verifies that EnableAuroraCollectors flips the
+// aurora_* collector defaults to enabled, leaves non-aurora collectors alone,
+// and respects user-forced flags (--no-collector.aurora_X).
+func TestEnableAuroraCollectors(t *testing.T) {
+	// Snapshot current state to restore at the end so we don't poison
+	// other tests in the package.
+	snapshot := make(map[string]bool, len(collectorState))
+	for k, v := range collectorState {
+		snapshot[k] = *v
+	}
+	originalForced := forcedCollectors
+	forcedCollectors = map[string]bool{
+		// Simulate the user passing --no-collector.aurora_stat_bgwriter:
+		// the explicit flag must win even when Aurora support is on.
+		"aurora_stat_bgwriter": true,
+	}
+	t.Cleanup(func() {
+		for k, v := range snapshot {
+			*collectorState[k] = v
+		}
+		forcedCollectors = originalForced
+	})
+
+	// Reset all aurora_* to disabled to start clean.
+	for name, state := range collectorState {
+		if strings.HasPrefix(name, "aurora_") {
+			*state = false
+		}
+	}
+	// And pin a known non-aurora collector to disabled so we can prove
+	// EnableAuroraCollectors does not touch it.
+	if state, ok := collectorState["wal"]; ok {
+		*state = false
+	}
+
+	EnableAuroraCollectors()
+
+	for name, state := range collectorState {
+		got := *state
+		switch {
+		case name == "aurora_stat_bgwriter":
+			if got {
+				t.Errorf("forced collector %q must stay disabled, got enabled", name)
+			}
+		case strings.HasPrefix(name, "aurora_"):
+			if !got {
+				t.Errorf("aurora collector %q should be enabled, got disabled", name)
+			}
+		case name == "wal":
+			if got {
+				t.Errorf("non-aurora collector %q must not be touched", name)
+			}
+		}
+	}
+}
+
+func TestIsAuroraUnsupportedFunction(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		// Should match — real Aurora errors:
+		{
+			name: "aurora pg_last_xact_replay_timestamp",
+			err:  &pq.Error{Code: "0A000", Message: "pg_last_xact_replay_timestamp() is currently not supported for Aurora"},
+			want: true,
+		},
+		{
+			name: "aurora pg_ls_waldir",
+			err:  &pq.Error{Code: "0A000", Message: "pg_ls_waldir() is currently not supported for Aurora"},
+			want: true,
+		},
+		// Should NOT match:
+		{name: "nil error", err: nil, want: false},
+		{name: "plain error (not pq)", err: errors.New("connection refused"), want: false},
+		{name: "permission denied (42501)", err: &pq.Error{Code: "42501", Message: "permission denied for function pg_ls_waldir"}, want: false},
+		{name: "undefined function (42883)", err: &pq.Error{Code: "42883", Message: "function aurora_replica_status() does not exist"}, want: false},
+		{name: "syntax error (42601)", err: &pq.Error{Code: "42601", Message: "syntax error near 'Aurora'"}, want: false},
+		{name: "feature_not_supported but not Aurora", err: &pq.Error{Code: "0A000", Message: "this feature is not yet implemented"}, want: false},
+		{name: "connection failure (08006)", err: &pq.Error{Code: "08006", Message: "connection failure on Aurora cluster"}, want: false},
+		{name: "internal error (XX000)", err: &pq.Error{Code: "XX000", Message: "internal Aurora storage error"}, want: false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isAuroraUnsupportedFunction(c.err); got != c.want {
+				t.Errorf("isAuroraUnsupportedFunction(%v) = %v, want %v", c.err, got, c.want)
+			}
+		})
 	}
 }

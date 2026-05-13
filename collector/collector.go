@@ -19,10 +19,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/alecthomas/kingpin/v2"
+	"github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -94,6 +96,7 @@ type PostgresCollector struct {
 
 	instance          *instance
 	CollectionTimeout time.Duration
+	auroraEnabled     bool
 }
 
 type Option func(*PostgresCollector) error
@@ -154,9 +157,38 @@ func NewPostgresCollector(logger *slog.Logger, excludeDatabases []string, dsn st
 	if err != nil {
 		return nil, err
 	}
+	instance.auroraSupportEnabled = p.auroraEnabled
 	p.instance = instance
 
 	return p, nil
+}
+
+// WithAuroraEnabled tells PostgresCollector that Aurora support is enabled
+// globally. Without this, instance.setup() skips the aurora_version() probe
+// and all aurora_* collectors silently emit no data.
+func WithAuroraEnabled(enabled bool) Option {
+	return func(e *PostgresCollector) error {
+		e.auroraEnabled = enabled
+		return nil
+	}
+}
+
+// EnableAuroraCollectors flips the default state of every aurora_* collector
+// to enabled. Per-collector flags (--collector.aurora_X or --no-collector.X)
+// that the user passed explicitly still win because forcedCollectors records
+// those during flag parsing.
+//
+// Call this once, after kingpin.Parse() and before NewPostgresCollector.
+func EnableAuroraCollectors() {
+	for name, state := range collectorState {
+		if !strings.HasPrefix(name, "aurora_") {
+			continue
+		}
+		if forcedCollectors[name] {
+			continue
+		}
+		*state = true
+	}
 }
 
 func WithCollectionTimeout(s string) Option {
@@ -252,6 +284,20 @@ var ErrNoData = errors.New("collector returned no data")
 
 func IsNoDataError(err error) bool {
 	return err == ErrNoData
+}
+
+// isAuroraUnsupportedFunction reports whether the error is Aurora PostgreSQL
+// rejecting a query because it calls a function unsupported on Aurora (for
+// example pg_last_xact_replay_timestamp or pg_ls_waldir). Aurora surfaces
+// these as Postgres error class "0A" (feature_not_supported) with a message
+// that contains "Aurora". Used by collectors to fall back gracefully instead
+// of failing the whole scrape.
+func isAuroraUnsupportedFunction(err error) bool {
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		return pqErr.Code.Class() == "0A" && strings.Contains(pqErr.Message, "Aurora")
+	}
+	return false
 }
 
 func Int32(m sql.NullInt32) float64 {
